@@ -66,20 +66,25 @@ install_packages() {
     esac
     if have rpm-ostree; then install_brew; return; fi
 
+    # Leave an existing Node alone (e.g. Arch's nodejs-lts-* conflicts with nodejs).
+    local node="nodejs npm"
+    have node && node=""
+
+    # shellcheck disable=SC2086
     if have pacman; then
         say "pacman: installing packages"
         sudo_ pacman -S --needed --noconfirm git curl tmux fish neovim ripgrep fd unzip gcc make \
-            tree-sitter-cli nodejs npm wl-clipboard
+            tree-sitter-cli $node wl-clipboard
     elif have apt-get; then
         say "apt: installing packages"
         sudo_ apt-get update
         sudo_ apt-get install -y git curl tmux fish ripgrep fd-find unzip build-essential \
-            nodejs npm xclip wl-clipboard
+            $node xclip wl-clipboard
         # Debian/Ubuntu name the fd binary fdfind.
         if have fdfind && ! have fd; then mkdir -p "$LOCAL_BIN"; ln -sf "$(command -v fdfind)" "$LOCAL_BIN/fd"; fi
     elif have dnf; then
         say "dnf: installing packages"
-        sudo_ dnf install -y git curl tmux fish neovim ripgrep fd-find unzip gcc make nodejs npm wl-clipboard
+        sudo_ dnf install -y git curl tmux fish neovim ripgrep fd-find unzip gcc make $node wl-clipboard
     else
         warn "Unknown package manager. Install these yourself: git curl tmux fish neovim ripgrep fd unzip gcc make"
     fi
