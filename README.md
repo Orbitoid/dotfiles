@@ -1,0 +1,87 @@
+# dotfiles
+
+tmux, fish, and a Neovim setup in the style of ThePrimeagen's, plus `tm`, a small
+tmux session launcher. Works on macOS and most Linux distros (Arch/CachyOS,
+Mint/Ubuntu/Debian, Fedora, SteamOS, Bazzite).
+
+## Install
+
+```sh
+git clone https://github.com/<you>/dotfiles ~/dotfiles
+~/dotfiles/install.sh              # packages + configs
+~/dotfiles/install.sh --no-packages   # configs only
+```
+
+The installer:
+
+- installs `tmux fish neovim ripgrep fd git gcc make unzip node` and the
+  `tree-sitter` CLI with the system package manager. It uses Homebrew on macOS
+  and on immutable systems (SteamOS, Bazzite).
+- downloads the official Neovim build into `~/.local` when the distro's version
+  is older than 0.11 (e.g. on Mint).
+- symlinks the configs into place. Anything it would replace is renamed to
+  `*.bak.<timestamp>`.
+- fetches the tmux and Neovim plugins.
+
+Re-run it any time; it skips anything already done. Configs are symlinks, so
+`git pull` updates them straight away.
+
+| Repo | Linked to |
+|---|---|
+| `tmux/tmux.conf` | `~/.config/tmux/tmux.conf` |
+| `nvim/` | `~/.config/nvim` |
+| `bin/tm` | `~/.local/bin/tm` |
+| `fish/conf.d/dotfiles.fish` | `~/.config/fish/conf.d/` (PATH, Homebrew) |
+| `fish/completions/tm.fish` | `~/.config/fish/completions/` |
+| `shell/tm.bash`, `shell/tm.zsh` | sourced from `~/.bashrc` / `~/.zshrc` |
+
+## tm
+
+| Command | Does |
+|---|---|
+| `tm` | attach to the most recent session (or start one) |
+| `tm NAME` | attach to `NAME`, creating it if needed |
+| `tm <Tab>` | running sessions, most recent first |
+| `tm abc<Tab>` | sessions starting with `abc`; if none, folders in `~/active_workspaces` |
+
+New sessions start in `~/active_workspaces/NAME` if that folder exists. Set
+`TM_WORKSPACES` to use a different folder.
+
+## tmux
+
+Prefix is **Ctrl+a**.
+
+| Keys | Action |
+|---|---|
+| `C-a d` | detach |
+| `C-a c` | new window |
+| `C-a n` / `C-a p` | next / previous window |
+| `C-a x` | kill window (asks first) |
+| <code>C-a &#124;</code> | split left/right |
+| `C-a _` | split top/bottom |
+| `C-a r` | reload config |
+
+Sessions are saved every 5 minutes (tmux-resurrect + tmux-continuum). The first
+`tm` after a reboot restores them: windows, splits, working directories and
+on-screen text. Most programs restart as a fresh shell, apart from a few like
+vim and less.
+
+## Neovim
+
+Leader is **Space**. Plugins are managed by lazy.nvim: telescope, harpoon,
+treesitter, LSP (mason + nvim-cmp), fugitive, undotree, rose-pine.
+
+| Keys | Action |
+|---|---|
+| `<leader>pv` | file explorer |
+| `<leader>pf` / `C-p` | find files / git files |
+| `<leader>ps` | grep |
+| `<leader>a` / `C-e` | harpoon add / menu |
+| `C-h C-t C-n C-s` | harpoon files 1–4 |
+| `<leader>u` | undotree |
+| `<leader>gs` | git status (fugitive) |
+| `gd`, `K`, `<leader>vca`, `<leader>vrn` | LSP definition, hover, code action, rename |
+| `<leader>f` | format |
+| `<leader>y` | yank to system clipboard |
+
+Install more language servers with `:Mason`. They're enabled automatically.

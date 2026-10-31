@@ -1,0 +1,63 @@
+#!/bin/sh
+# tm - attach to (or create) a named tmux session.
+#
+#   tm               attach to the most recent session (or start a new one)
+#   tm NAME          attach to session NAME, creating it if it doesn't exist
+#   tm --complete T  completion candidates for T (used by the shell completions)
+#
+# New sessions start in $TM_WORKSPACES/NAME when that folder exists.
+# The first run after a reboot restores the last tmux-resurrect save.
+
+workspaces=${TM_WORKSPACES:-$HOME/active_workspaces}
+resurrect_last=$HOME/.local/share/tmux/resurrect/last
+restore_script=${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tmux-resurrect/scripts/restore.sh
+
+# Running sessions starting with $1 (most recent first); if there are none,
+# folder names in $workspaces. One "name<TAB>kind" per line.
+complete() {
+    matches=$(tmux list-sessions -F '#{session_activity} #{session_name}' 2>/dev/null |
+        sort -rn | cut -d' ' -f2- |
+        awk -v t="$1" 'NF && index(tolower($0), tolower(t)) == 1 { print $0 "\tsession" }')
+    if [ -n "$matches" ]; then
+        printf '%s\n' "$matches"
+        return
+    fi
+    for d in "$workspaces"/*/; do
+        [ -d "$d" ] || continue
+        d=${d%/}
+        printf '%s\tworkspace\n' "${d##*/}"
+    done
+}
+
+case $1 in
+    --complete) complete "$2"; exit ;;
+    -h|--help) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit ;;
+esac
+
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "tm: tmux is not installed" >&2
+    exit 1
+fi
+
+if ! tmux has-session 2>/dev/null && [ -e "$resurrect_last" ] && [ -x "$restore_script" ]; then
+    tmux start-server \; run-shell "$restore_script"
+fi
+
+if [ $# -eq 0 ]; then
+    if [ -n "$TMUX" ]; then
+        exec tmux choose-tree -s
+    fi
+    tmux attach 2>/dev/null || exec tmux new-session
+    exit
+fi
+
+# tmux turns '.' and ':' into '_' in session names.
+name=$(printf '%s' "$*" | tr '.:' '__')
+dir=$PWD
+[ -d "$workspaces/$*" ] && dir=$workspaces/$*
+
+if [ -n "$TMUX" ]; then
+    tmux has-session -t "=$name" 2>/dev/null || tmux new-session -d -s "$name" -c "$dir"
+    exec tmux switch-client -t "=$name"
+fi
+exec tmux new-session -A -s "$name" -c "$dir"
