@@ -41,7 +41,7 @@ ensure_brew() {
 
 install_brew() {
     ensure_brew
-    local pkgs="git tmux fish neovim ripgrep fd node"
+    local pkgs="git tmux fish neovim ripgrep fd node gitleaks"
     [ "$(uname -s)" = Linux ] && pkgs="$pkgs gcc make unzip"
     say "brew install $pkgs"
     # shellcheck disable=SC2086
@@ -74,7 +74,7 @@ install_packages() {
     if have pacman; then
         say "pacman: installing packages"
         sudo_ pacman -S --needed --noconfirm git curl tmux fish neovim ripgrep fd unzip gcc make \
-            tree-sitter-cli $node wl-clipboard
+            tree-sitter-cli gitleaks $node wl-clipboard
     elif have apt-get; then
         say "apt: installing packages"
         sudo_ apt-get update
@@ -127,6 +127,25 @@ ensure_tree_sitter() {
     chmod +x "$LOCAL_BIN/tree-sitter"
 }
 
+# Secret scanner used by the repo's git hooks (.githooks/check-private).
+ensure_gitleaks() {
+    have gitleaks && return
+    local os arch tag
+    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) return ;; esac
+    case "$(uname -m)" in
+        x86_64|amd64) arch=x64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) warn "No gitleaks release for $(uname -m)"; return ;;
+    esac
+    tag="$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest |
+        sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')"
+    [ -n "$tag" ] || { warn "Couldn't look up the latest gitleaks release"; return; }
+    say "Installing gitleaks $tag to ~/.local/bin"
+    mkdir -p "$LOCAL_BIN"
+    curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v$tag/gitleaks_${tag}_${os}_${arch}.tar.gz" |
+        tar -xz -C "$LOCAL_BIN" gitleaks
+}
+
 # --- Linking ------------------------------------------------------------------
 
 backup() {
@@ -167,6 +186,22 @@ link_configs() {
     fi
 }
 
+# Block commits/pushes of this repo that contain secrets or personal info.
+setup_hooks() {
+    git -C "$DOT" config core.hooksPath .githooks
+    local list="$CONFIG/dotfiles/private-strings"
+    if [ ! -e "$list" ]; then
+        mkdir -p "$(dirname "$list")"
+        cat > "$list" <<'LIST'
+# Personal strings that must never be committed to the public dotfiles repo.
+# One per line, case-insensitive. Lines starting with # are ignored.
+# This file is NOT part of the repo. Examples: your full name, home address,
+# phone number, personal email addresses, work/company names, device names.
+LIST
+        say "Created $list (add your name, address, etc.)"
+    fi
+}
+
 fetch_tmux_plugins() {
     local dir="$CONFIG/tmux/plugins" p
     mkdir -p "$dir"
@@ -203,8 +238,10 @@ main() {
         ensure_nvim
         ensure_tree_sitter
     fi
+    ensure_gitleaks
 
     link_configs
+    setup_hooks
     fetch_tmux_plugins
     fetch_nvim_plugins
 

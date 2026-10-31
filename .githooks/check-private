@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# check-private - refuse commits/pushes that contain secrets or personal info.
+#
+#   check-private staged          staged changes + commit identity (pre-commit)
+#   check-private message FILE    a commit message (commit-msg)
+#   check-private log REV...      every commit in `git log REV...` (pre-push)
+#   check-private all             the whole history
+#
+# Personal strings to block (your real name, address, phone number, other
+# emails, ...) go in ~/.config/dotfiles/private-strings, one per line. That
+# file lives outside the repo and is never committed.
+#
+# A line containing "allow-private" is skipped. Use it only for a reviewed
+# false positive. gitleaks, when installed, runs as well and has no such escape.
+
+set -uo pipefail
+
+PRIVATE_LIST="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles/private-strings"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+: > "$tmp/loc"; : > "$tmp/txt"; : > "$tmp/names"; : > "$tmp/ident"; : > "$tmp/found"
+
+# --- Collect what is about to be published --------------------------------
+# $tmp/txt holds one line of text per line, $tmp/loc where it came from.
+
+# stdin: `git diff -p` / `git log -p --format='commit %h'` output.
+collect_diff() {
+    awk -v loc="$tmp/loc" -v txt="$tmp/txt" -v found="$tmp/found" '
+        /^commit [0-9a-f]+$/ { c = $2 " "; next }
+        /^\+\+\+ / { f = substr($0, 5); sub(/^b\//, "", f); next }
+        /^Binary files / { print c "binary file: " $0 >> found; next }
+        /^\+/ { print c f >> loc; print substr($0, 2) >> txt }
+    '
+}
+
+# collect_lines LABEL < text
+collect_lines() {
+    awk -v label="$1" -v loc="$tmp/loc" -v txt="$tmp/txt" '
+        { print label >> loc; print >> txt }
+    '
+}
+
+# stdin: "<label>\t<name> <email>" lines.
+collect_idents() {
+    tee -a "$tmp/ident" | awk -F '\t' -v loc="$tmp/loc" -v txt="$tmp/txt" '
+        { print $1 >> loc; print $2 >> txt }
+    '
+}
+
+mode=${1:-staged}
+[ $# -gt 0 ] && shift
+case $mode in
+    staged)
+        git diff --cached -p -U0 --no-color --no-ext-diff | collect_diff
+        git diff --cached --name-only --diff-filter=ACR > "$tmp/names"
+        {
+            printf 'author\t%s\n' "$(git var GIT_AUTHOR_IDENT | sed 's/ [0-9]* [-+][0-9]*$//')"
+            printf 'committer\t%s\n' "$(git var GIT_COMMITTER_IDENT | sed 's/ [0-9]* [-+][0-9]*$//')"
+        } | collect_idents
+        ;;
+    message)
+        grep -v '^#' "$1" | collect_lines "commit message"
+        ;;
+    log|all)
+        [ "$mode" = all ] && set -- --all
+        git log -p -U0 --no-color --no-ext-diff --format='commit %h' "$@" | collect_diff
+        git log --name-only --diff-filter=ACR --format= "$@" | sort -u > "$tmp/names"
+        git log --format='%h message%n%B' "$@" | awk -v loc="$tmp/loc" -v txt="$tmp/txt" '
+            /^[0-9a-f]+ message$/ { c = $0; next } { print c >> loc; print >> txt }'
+        git log --format='%h author%x09%an <%ae>%n%h committer%x09%cn <%ce>' "$@" | collect_idents
+        ;;
+    *)
+        sed -n '2,15s/^# \{0,1\}//p' "$0" >&2
+        exit 2
+        ;;
+esac
+
+# Blank out reviewed false positives (keeps line numbers aligned with loc).
+awk '/allow-private/ { print ""; next } { print }' "$tmp/txt" > "$tmp/scan"
+
+# --- Rules -----------------------------------------------------------------
+# Patterns are written so they never match their own source text.
+
+report() { # LINE-NUMBER RULE MATCH
+    printf '%s: %s: %s\n' "$(sed -n "${1}p" "$tmp/loc")" "$2" "$3" >> "$tmp/found"
+}
+
+mask() { printf '%s****' "${1:0:6}"; }
+
+# rule NAME show|mask GREP-FLAGS REGEX [ALLOW-REGEX]
+rule() {
+    local name=$1 show=$2 flags=$3 re=$4 allow=${5:-} hit n m
+    # shellcheck disable=SC2086
+    grep -n -o -E $flags -e "$re" "$tmp/scan" | while IFS= read -r hit; do
+        n=${hit%%:*}
+        m=${hit#*:}
+        if [ -n "$allow" ] && printf '%s' "$m" | grep -qiE -e "$allow"; then continue; fi
+        [ "$show" = mask ] && m=$(mask "$m")
+        report "$n" "$name" "$m"
+    done
+}
+
+rule "private key"        mask "" '-----BEGIN[ A-Z]*PRIVATE[ ]KEY'
+rule "AWS access key"     mask "" '(AKIA|ASIA)[0-9A-Z]{16}'
+rule "GitHub token"       mask "" 'gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}'
+rule "API key (sk-...)"   mask "" 'sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}'
+rule "Slack token"        mask "" 'xox[abprs]-[A-Za-z0-9-]{10,}'
+rule "Google API key"     mask "" 'AIza[0-9A-Za-z_-]{35}'
+rule "Stripe key"         mask "" '[rs]k_live_[0-9A-Za-z]{20,}'
+rule "JWT"                mask "" 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.'
+rule "URL with password"  mask "" '[a-z][a-z0-9+.-]*://[^/ :@]+:[^/ @]+@'
+rule "password/secret assignment" mask "-i" \
+    '(password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token)[a-z0-9_-]*["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[^[:space:]"'"'"'$({<]{8,}'
+rule "email address"      show "" '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
+    'noreply|no-reply|@example\.(com|org|net)$|^git@'
+rule "IP address"         show "" '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' '^(127\.|0\.0\.0\.0)'
+rule "home directory path" show "" '/(home|Users)/[A-Za-z0-9._-]+' '^/home/linuxbrew$'
+
+# Personal strings: the private list, plus this machine's git email and real name.
+{
+    [ -r "$PRIVATE_LIST" ] && grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$PRIVATE_LIST"
+    git config --global user.email 2>/dev/null
+    if [ "$(uname -s)" = Darwin ]; then id -F 2>/dev/null; else getent passwd "$(id -un)" 2>/dev/null | cut -d: -f5 | cut -d, -f1; fi
+} | grep -v -i -e noreply -e '^[[:space:]]*$' -e "^$(id -un)\$" | sed 's/[[:space:]]*$//' > "$tmp/personal"
+if [ -s "$tmp/personal" ]; then
+    grep -n -o -i -F -f "$tmp/personal" "$tmp/scan" | while IFS= read -r hit; do
+        report "${hit%%:*}" "personal info" "${hit#*:}"
+    done
+fi
+
+# Files that should never be in a public dotfiles repo.
+grep -E -i -e '(^|/)(\.env(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc|ovpn)|\.netrc|\.npmrc|\.pypirc|\.git-credentials|credentials(\.json)?|known_hosts|authorized_keys|hosts\.yml|fish_variables|fish_history|\.[a-z]*_history|.*\.bak(\..*)?)$' \
+    "$tmp/names" | while IFS= read -r f; do
+    printf '%s: sensitive file name\n' "$f" >> "$tmp/found"
+done
+
+# Commits must use a GitHub noreply address so your real email isn't published.
+awk -F '\t' '$2 !~ /noreply/ { print $1 ": commit identity is not a noreply address: " $2 }' \
+    "$tmp/ident" >> "$tmp/found"
+
+# --- gitleaks (second opinion, if installed) ---------------------------------
+gitleaks_ok=1
+if command -v gitleaks >/dev/null 2>&1; then
+    case $mode in
+        staged)  gitleaks git --pre-commit --staged --redact --no-banner --log-level error >/dev/null 2>"$tmp/gl" || gitleaks_ok=0 ;;
+        message) gitleaks stdin --redact --no-banner --log-level error < "$1" >/dev/null 2>"$tmp/gl" || gitleaks_ok=0 ;;
+        log|all) gitleaks git --redact --no-banner --log-level error --log-opts="$*" >/dev/null 2>"$tmp/gl" || gitleaks_ok=0 ;;
+    esac
+    if [ "$gitleaks_ok" -eq 0 ]; then
+        echo "gitleaks: found possible secrets (run the same scan with -v to see them):" >> "$tmp/found"
+        cat "$tmp/gl" >> "$tmp/found"
+    fi
+else
+    echo "check-private: gitleaks not installed; only the built-in checks ran." >&2
+fi
+
+# --- Verdict ---------------------------------------------------------------
+if [ -s "$tmp/found" ]; then
+    {
+        echo
+        echo "BLOCKED: this would publish secrets or personal info:"
+        echo
+        sed 's/^/  /' "$tmp/found"
+        echo
+        echo "Remove it and try again. For a reviewed false positive, add the text"
+        echo "\"allow-private\" to that line. Personal strings: $PRIVATE_LIST"
+        echo
+    } >&2
+    exit 1
+fi
+[ -r "$PRIVATE_LIST" ] || echo "check-private: $PRIVATE_LIST missing; add your name/address/etc. there." >&2
+exit 0

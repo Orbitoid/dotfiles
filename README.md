@@ -35,6 +35,29 @@ Re-run it any time; it skips anything already done. Configs are symlinks, so
 | `fish/completions/tm.fish` | `~/.config/fish/completions/` |
 | `shell/tm.bash`, `shell/tm.zsh` | sourced from `~/.bashrc` / `~/.zshrc` |
 
+## Keeping secrets out
+
+This repo is public, so git hooks in `.githooks/` (switched on by `install.sh`
+via `core.hooksPath`) block any commit or push that would publish:
+
+- keys and tokens: private keys, AWS/GitHub/Anthropic/OpenAI/Slack/Google/Stripe
+  keys, JWTs, passwords in URLs, and password, token or API-key assignments
+- personal info: email addresses, IP addresses, `/home/<user>` paths, and every
+  string in `~/.config/dotfiles/private-strings` (your name, address, phone, ...).
+  That list lives outside the repo, so it's never published itself.
+- risky files: `.env`, SSH keys, `*.pem`/`*.key`, shell history,
+  `fish_variables`, `.bak` files, binaries
+- commits whose author email isn't a GitHub `noreply` address
+
+It checks staged changes (pre-commit), the commit message (commit-msg), and
+every commit about to be pushed (pre-push). [gitleaks](https://github.com/gitleaks/gitleaks)
+also runs as a second scanner. Run `.githooks/check-private all` to scan the
+whole history by hand.
+
+For a reviewed false positive, put `allow-private` on that line. `--no-verify`
+skips the commit hooks, but the pre-push hook still checks those commits
+unless you skip it as well.
+
 ## tm
 
 | Command | Does |
