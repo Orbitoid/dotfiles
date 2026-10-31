@@ -41,7 +41,7 @@ ensure_brew() {
 
 install_brew() {
     ensure_brew
-    local pkgs="git tmux fish neovim ripgrep fd node gitleaks"
+    local pkgs="git tmux fish neovim ripgrep fd node gitleaks starship fontconfig"
     [ "$(uname -s)" = Linux ] && pkgs="$pkgs gcc make unzip"
     say "brew install $pkgs"
     # shellcheck disable=SC2086
@@ -74,7 +74,7 @@ install_packages() {
     if have pacman; then
         say "pacman: installing packages"
         sudo_ pacman -S --needed --noconfirm git curl tmux fish neovim ripgrep fd unzip gcc make \
-            tree-sitter-cli gitleaks $node wl-clipboard
+            tree-sitter-cli gitleaks starship $node wl-clipboard
     elif have apt-get; then
         say "apt: installing packages"
         sudo_ apt-get update
@@ -175,6 +175,10 @@ link_configs() {
     link tmux/tmux.conf "$CONFIG/tmux/tmux.conf"
     link nvim "$CONFIG/nvim"
     link bin/tm "$LOCAL_BIN/tm"
+    link bin/term-setup "$LOCAL_BIN/term-setup"
+    link alacritty/alacritty.toml "$CONFIG/alacritty/alacritty.toml"
+    link starship/starship.toml "$CONFIG/starship.toml"
+    link fish/conf.d/prompt.fish "$CONFIG/fish/conf.d/prompt.fish"
     link fish/conf.d/dotfiles.fish "$CONFIG/fish/conf.d/dotfiles.fish"
     link fish/completions/tm.fish "$CONFIG/fish/completions/tm.fish"
     # An older fish-function version of tm would shadow bin/tm.

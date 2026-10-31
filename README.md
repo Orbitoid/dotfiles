@@ -1,7 +1,8 @@
 # dotfiles
 
-tmux, fish, and a Neovim setup in the style of ThePrimeagen's, plus `tm`, a small
-tmux session launcher. Works on macOS and most Linux distros (Arch/CachyOS,
+tmux, fish, Alacritty, and a Neovim setup in the style of ThePrimeagen's, plus
+`tm`, a small tmux session launcher, and `term-setup`, a setup wizard for the
+terminal's look. Works on macOS and most Linux distros (Arch/CachyOS,
 Mint/Ubuntu/Debian, Fedora, SteamOS, Bazzite).
 
 ## Install
@@ -31,9 +32,29 @@ Re-run it any time; it skips anything already done. Configs are symlinks, so
 | `tmux/tmux.conf` | `~/.config/tmux/tmux.conf` |
 | `nvim/` | `~/.config/nvim` |
 | `bin/tm` | `~/.local/bin/tm` |
+| `bin/term-setup` | `~/.local/bin/term-setup` |
+| `alacritty/alacritty.toml` | `~/.config/alacritty/alacritty.toml` |
+| `fish/conf.d/prompt.fish` | `~/.config/fish/conf.d/` (written by `term-setup`) |
+| `starship/starship.toml` | `~/.config/starship.toml` (written by `term-setup`) |
 | `fish/conf.d/dotfiles.fish` | `~/.config/fish/conf.d/` (PATH, Homebrew) |
 | `fish/completions/tm.fish` | `~/.config/fish/completions/` |
 | `shell/tm.bash`, `shell/tm.zsh` | sourced from `~/.bashrc` / `~/.zshrc` |
+
+## term-setup
+
+Run `term-setup` to change how the terminal looks without editing config files:
+
+- **Transparency** and **font size**: Left/Right. Alacritty updates live.
+- **Font**: five popular Nerd Fonts (JetBrains Mono, Fira Code, Hack, Meslo,
+  Cascadia), downloaded and installed on demand, or `/` to search every
+  installed monospace font. The highlighted font is previewed live.
+- **Prompt**: fish's built-in prompts and, if starship is installed, starship's
+  presets. Each is previewed in a home folder, a git repo with changes, and
+  after a failed command.
+
+Esc cancels and restores everything. Saved changes land in this repo, so commit
+and push them to get them on your other machines. The prompt applies to fish
+only.
 
 ## Keeping secrets out
 

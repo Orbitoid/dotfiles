@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""term-setup - interactive setup for Alacritty and the fish prompt.
+
+Transparency, font and font size change live while you browse (Alacritty
+reloads its config on every save). Esc on the main screen puts everything back.
+
+Files it edits (symlinked into the dotfiles repo by install.sh):
+  ~/.config/alacritty/alacritty.toml
+  ~/.config/fish/conf.d/prompt.fish
+  ~/.config/starship.toml            (only for starship prompts)
+"""
+
+import curses
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unicodedata
+import urllib.request
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+ALACRITTY = os.path.join(CONFIG, "alacritty", "alacritty.toml")
+PROMPT_FILE = os.path.join(CONFIG, "fish", "conf.d", "prompt.fish")
+STARSHIP_FILE = os.path.join(CONFIG, "starship.toml")
+IS_MAC = sys.platform == "darwin"
+FONT_DIR = (os.path.join(HOME, "Library", "Fonts") if IS_MAC
+            else os.path.join(HOME, ".local", "share", "fonts", "NerdFonts"))
+
+# (family name, archive name in the Nerd Fonts releases)
+POPULAR_FONTS = [
+    ("JetBrainsMono Nerd Font", "JetBrainsMono"),
+    ("FiraCode Nerd Font", "FiraCode"),
+    ("Hack Nerd Font", "Hack"),
+    ("MesloLGS Nerd Font", "Meslo"),
+    ("CaskaydiaCove Nerd Font", "CascadiaCode"),
+]
+NERD_FONTS_URL = "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/%s.tar.xz"
+FONT_SAMPLE = "0O oO il1| {}[]() => != -> <= ==      "
+
+SCENARIOS = [
+    ("Just opened a terminal", "home", False),
+    ("In a git repo with changes", "repo", False),
+    ("After a command failed", "repo", True),
+]
+
+
+def run(cmd, **kw):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10, **kw).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def write_through(path, text):
+    """Write text to path, following a symlink so the link itself survives."""
+    real = os.path.realpath(path)
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real))
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, real)
+
+
+# --- Minimal TOML editing (keeps comments and layout) ------------------------
+
+def _section_bounds(lines, section):
+    header = "[%s]" % section
+    start = next((i for i, l in enumerate(lines) if l.strip() == header), None)
+    if start is None:
+        return None, None
+    end = start + 1
+    while end < len(lines) and not lines[end].lstrip().startswith("["):
+        end += 1
+    return start, end
+
+
+def toml_get(text, section, key):
+    lines = text.split("\n")
+    start, end = _section_bounds(lines, section)
+    if start is None:
+        return None
+    for line in lines[start + 1:end]:
+        m = re.match(r"\s*%s\s*=\s*(.*?)\s*$" % re.escape(key), line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def toml_set(text, section, key, value):
+    """Set section.key to the TOML literal `value`; None removes the key."""
+    lines = text.split("\n")
+    start, end = _section_bounds(lines, section)
+    if start is None:
+        if value is None:
+            return text
+        return text.rstrip("\n") + "\n\n[%s]\n%s = %s\n" % (section, key, value)
+    pattern = re.compile(r"\s*%s\s*=" % re.escape(key))
+    for i in range(start + 1, end):
+        if pattern.match(lines[i]):
+            if value is None:
+                del lines[i]
+            else:
+                lines[i] = "%s = %s" % (key, value)
+            return "\n".join(lines)
+    if value is None:
+        return text
+    at = end
+    while at > start + 1 and not lines[at - 1].strip():
+        at -= 1
+    lines.insert(at, "%s = %s" % (key, value))
+    return "\n".join(lines)
+
+
+class AlacrittyConfig:
+    def __init__(self):
+        self.existed = os.path.exists(ALACRITTY)
+        if self.existed:
+            with open(ALACRITTY) as f:
+                self.original = f.read()
+        else:
+            self.original = "[general]\nlive_config_reload = true\n"
+        self.text = self.original
+
+    def _set(self, section, key, value):
+        self.text = toml_set(self.text, section, key, value)
+        write_through(ALACRITTY, self.text)
+
+    @property
+    def opacity(self):
+        try:
+            return float(toml_get(self.text, "window", "opacity") or 1.0)
+        except ValueError:
+            return 1.0
+
+    @opacity.setter
+    def opacity(self, value):
+        self._set("window", "opacity", "%.2f" % value)
+
+    @property
+    def size(self):
+        try:
+            return float(toml_get(self.text, "font", "size") or 11.25)
+        except ValueError:
+            return 11.25
+
+    @size.setter
+    def size(self, value):
+        self._set("font", "size", "%.1f" % value)
+
+    @property
+    def font(self):
+        m = re.search(r'family\s*=\s*"([^"]*)"', toml_get(self.text, "font", "normal") or "")
+        return m.group(1) if m else "(default)"
+
+    @font.setter
+    def font(self, family):
+        # Bold/italic default to the normal family, so drop any stale overrides.
+        for key in ("bold", "italic", "bold_italic"):
+            self.text = toml_set(self.text, "font", key, None)
+        self._set("font", "normal", '{ family = "%s" }' % family)
+
+    def restore(self):
+        if self.text == self.original:
+            return
+        self.text = self.original
+        if self.existed:
+            write_through(ALACRITTY, self.original)
+        else:
+            os.remove(os.path.realpath(ALACRITTY))
+
+
+# --- Fonts --------------------------------------------------------------------
+
+def font_families(monospace_only):
+    if not shutil.which("fc-list"):
+        return []
+    families = set()
+    for line in run(["fc-list", "-f", "%{family[0]}|%{spacing}\n"]).splitlines():
+        family, _, spacing = line.rpartition("|")
+        if not family or family.endswith(".pcf"):
+            continue
+        if monospace_only and not (spacing.isdigit() and int(spacing) >= 90):
+            continue
+        families.add(family)
+    return sorted(families, key=str.lower)
+
+
+def install_font(family, archive, progress):
+    """Download a Nerd Fonts archive and install just `family` from it."""
+    prefix = family.replace(" ", "") + "-"
+    dest = os.path.join(FONT_DIR, archive) if not IS_MAC else FONT_DIR
+    os.makedirs(dest, exist_ok=True)
+    with tempfile.TemporaryFile() as tmp:
+        with urllib.request.urlopen(NERD_FONTS_URL % archive, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                done += len(chunk)
+                progress("Downloading %s... %d/%d MB" % (archive, done >> 20, total >> 20))
+        tmp.seek(0)
+        progress("Installing %s..." % family)
+        with tarfile.open(fileobj=tmp, mode="r:xz") as tar:
+            for member in tar.getmembers():
+                name = os.path.basename(member.name)
+                if member.isfile() and name.startswith(prefix) and name.endswith((".ttf", ".otf")):
+                    with tar.extractfile(member) as src, open(os.path.join(dest, name), "wb") as out:
+                        shutil.copyfileobj(src, out)
+    if shutil.which("fc-cache"):
+        run(["fc-cache", "-f", dest])
+
+
+# --- Prompts ------------------------------------------------------------------
+
+class Prompts:
+    """Lists the available prompts and renders previews of them."""
+
+    def __init__(self):
+        self.tmp = tempfile.mkdtemp(prefix="term-setup-")
+        self.home = os.path.join(self.tmp, "home")
+        self.repo = os.path.join(self.home, "projects", "my-app")
+        os.makedirs(self.repo)
+        git = ["git", "-c", "user.name=x", "-c", "user.email=x@example.com", "-c", "init.defaultBranch=main"]
+        run(git + ["init", "-q"], cwd=self.repo)
+        with open(os.path.join(self.repo, "README.md"), "w") as f:
+            f.write("hello\n")
+        run(git + ["add", "."], cwd=self.repo)
+        run(git + ["commit", "-qm", "init"], cwd=self.repo)
+        with open(os.path.join(self.repo, "README.md"), "a") as f:
+            f.write("changed\n")
+        open(os.path.join(self.repo, "new-file.txt"), "w").close()
+        self.cache = {}
+        self.fish_data = run(["fish", "-c", "echo $__fish_data_dir"]).strip()
+
+    def cleanup(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def items(self):
+        """[(id, label)] - id is 'current', 'fish:NAME' or 'starship:NAME'."""
+        items = [("current", "Keep current prompt")]
+        for name in run(["fish", "-c", "fish_config prompt list"]).split():
+            items.append(("fish:" + name, "fish  " + name))
+        if shutil.which("starship"):
+            for name in run(["starship", "preset", "--list"]).split():
+                items.append(("starship:" + name, "starship  " + name))
+        else:
+            items.append(("install-starship", "starship  (Enter to install)"))
+        return items
+
+    def render(self, prompt_id, scenario, width):
+        key = (prompt_id, scenario, width)
+        if key not in self.cache:
+            self.cache[key] = self._render(prompt_id, scenario, width)
+        return self.cache[key]
+
+    def _render(self, prompt_id, scenario, width):
+        _, where, failed = SCENARIOS[scenario]
+        cwd = self.home if where == "home" else self.repo
+        env = dict(os.environ, HOME=self.home, PWD=cwd, XDG_CONFIG_HOME=CONFIG,
+                   TERM="xterm-256color", COLUMNS=str(width))
+        if prompt_id == "install-starship":
+            return ""
+        if prompt_id.startswith("starship:"):
+            cfg = os.path.join(self.tmp, prompt_id.split(":", 1)[1] + ".toml")
+            if not os.path.exists(cfg):
+                run(["starship", "preset", prompt_id.split(":", 1)[1], "-o", cfg])
+            env["STARSHIP_CONFIG"] = cfg
+            env.pop("STARSHIP_SHELL", None)
+            args = ["starship", "prompt", "--status", "1" if failed else "0", "--terminal-width", str(width)]
+            left = run(args, cwd=cwd, env=env).lstrip("\n")
+            right = run(args + ["--right"], cwd=cwd, env=env)
+            return left + "\x1e" + right
+        status = "false" if failed else "true"
+        choose = ""
+        if prompt_id.startswith("fish:"):
+            choose = "functions -e fish_right_prompt; fish_config prompt choose %s >/dev/null 2>&1; " % prompt_id[5:]
+        script = ("set -g fish_term256 1; set -g fish_term24bit 1; %s"
+                  "%s; fish_prompt; printf '\\x1e'; %s; fish_right_prompt 2>/dev/null"
+                  % (choose, status, status))
+        return run(["fish", "-c", script], cwd=cwd, env=env)
+
+    def current(self):
+        try:
+            with open(PROMPT_FILE) as f:
+                m = re.search(r"^# term-setup: (\S+)", f.read(), re.M)
+                return m.group(1) if m else "system"
+        except OSError:
+            return "system"
+
+    def apply(self, prompt_id):
+        kind, name = prompt_id.split(":", 1)
+        header = ("# Managed by term-setup: re-run it to change the prompt.\n"
+                  "# term-setup: %s\n\n" % prompt_id)
+        if kind == "fish":
+            # fish 4 embeds the sample prompts in its binary; fish 3 ships files.
+            body = run(["fish", "-c", "fish_config prompt list >/dev/null; "
+                        "set -l p (__fish_config_list_prompts %s); "
+                        "test -n \"$p\"; and __fish_config_with_file $p cat" % name])
+            for d in ("sample_prompts", os.path.join("tools", "web_config", "sample_prompts")):
+                sample = os.path.join(self.fish_data, d, name + ".fish")
+                if not body and os.path.exists(sample):
+                    with open(sample) as f:
+                        body = f.read()
+            if "function fish_prompt" not in body:
+                raise RuntimeError("couldn't read fish's %s prompt" % name)
+        else:
+            out = run(["starship", "preset", name])
+            if not out:
+                raise RuntimeError("starship preset %s failed" % name)
+            write_through(STARSHIP_FILE, out)
+            body = ("if status is-interactive; and command -q starship\n"
+                    "    starship init fish | source\n"
+                    "end\n")
+        write_through(PROMPT_FILE, header + body)
+
+
+def starship_install_command():
+    if shutil.which("brew"):
+        return ["brew", "install", "starship"]
+    if shutil.which("pacman"):
+        return ["sudo", "pacman", "-S", "--needed", "starship"]
+    if shutil.which("apt-get"):
+        return ["sudo", "apt-get", "install", "-y", "starship"]
+    if shutil.which("dnf"):
+        return ["sudo", "dnf", "install", "-y", "starship"]
+    return None
+
+
+# --- ANSI -> curses ---------------------------------------------------------------
+
+ANSI_RE = re.compile(r"\x1b\[([0-9;:?]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+                     r"|\x1b[()][0-9A-Za-z]|\x1b.|[\x00-\x08\x0b-\x1d\x1f]")
+
+
+def xterm_rgb(n):
+    if n < 16:
+        base = [(0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0), (0, 0, 238), (205, 0, 205),
+                (0, 205, 205), (229, 229, 229), (127, 127, 127), (255, 0, 0), (0, 255, 0),
+                (255, 255, 0), (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)]
+        return base[n]
+    if n < 232:
+        n -= 16
+        steps = [0, 95, 135, 175, 215, 255]
+        return steps[n // 36], steps[(n // 6) % 6], steps[n % 6]
+    v = 8 + (n - 232) * 10
+    return v, v, v
+
+
+def nearest_color(rgb, limit):
+    return min(range(limit), key=lambda i: sum((a - b) ** 2 for a, b in zip(xterm_rgb(i), rgb)))
+
+
+def parse_ansi(text):
+    """Split into lines of (text, fg, bg, bold, underline, reverse) runs.
+    Colours are xterm-256 indexes, or -1 for the terminal default."""
+    lines, line = [], []
+    fg, bg, bold, ul, rev = -1, -1, False, False, False
+    pos = 0
+
+    def emit(s):
+        parts = s.split("\n")
+        for i, part in enumerate(parts):
+            if i:
+                lines.append(line[:])
+                del line[:]
+            if part:
+                line.append((part, fg, bg, bold, ul, rev))
+
+    for m in ANSI_RE.finditer(text):
+        emit(text[pos:m.start()])
+        pos = m.end()
+        if m.group(2) != "m":
+            continue
+        codes = [int(c) if c.isdigit() else 0 for c in re.split("[;:]", m.group(1) or "0")]
+        i = 0
+        while i < len(codes):
+            c = codes[i]
+            if c == 0:
+                fg, bg, bold, ul, rev = -1, -1, False, False, False
+            elif c == 1:
+                bold = True
+            elif c == 22:
+                bold = False
+            elif c == 4:
+                ul = True
+            elif c == 24:
+                ul = False
+            elif c == 7:
+                rev = True
+            elif c == 27:
+                rev = False
+            elif 30 <= c <= 37:
+                fg = c - 30
+            elif 90 <= c <= 97:
+                fg = c - 82
+            elif 40 <= c <= 47:
+                bg = c - 40
+            elif 100 <= c <= 107:
+                bg = c - 92
+            elif c == 39:
+                fg = -1
+            elif c == 49:
+                bg = -1
+            elif c in (38, 48) and i + 1 < len(codes):
+                if codes[i + 1] == 5 and i + 2 < len(codes):
+                    color, i = codes[i + 2], i + 2
+                elif codes[i + 1] == 2 and i + 4 < len(codes):
+                    color, i = nearest_color(codes[i + 2:i + 5], 256), i + 4
+                else:
+                    color = -1
+                if c == 38:
+                    fg = color
+                else:
+                    bg = color
+            i += 1
+    emit(text[pos:])
+    lines.append(line)
+    return lines
+
+
+def cell_width(s):
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
+
+
+# --- UI ---------------------------------------------------------------------
+
+class UI:
+    def __init__(self, scr):
+        self.scr = scr
+        curses.curs_set(0)
+        scr.keypad(True)
+        self.pairs = {}
+        self.colors = 0
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            self.colors = curses.COLORS
+
+    def attr(self, fg, bg, bold=False, ul=False, rev=False):
+        if rev:
+            fg, bg = bg, fg
+        a = (curses.A_BOLD if bold else 0) | (curses.A_UNDERLINE if ul else 0)
+        if not self.colors:
+            return a | (curses.A_REVERSE if rev else 0)
+        fg = fg if fg < self.colors else nearest_color(xterm_rgb(fg), self.colors)
+        bg = bg if bg < self.colors else nearest_color(xterm_rgb(bg), self.colors)
+        if (fg, bg) not in self.pairs:
+            if len(self.pairs) + 1 >= curses.COLOR_PAIRS:
+                return a
+            curses.init_pair(len(self.pairs) + 1, fg, bg)
+            self.pairs[(fg, bg)] = len(self.pairs) + 1
+        return a | curses.color_pair(self.pairs[(fg, bg)])
+
+    def put(self, y, x, text, a=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                self.scr.addstr(y, x, text[:max(0, w - x - 1)], a)
+            except curses.error:
+                pass
+
+    def put_ansi_line(self, y, x, runs, width):
+        for text, fg, bg, bold, ul, rev in runs:
+            if width <= 0:
+                break
+            text = text[:width]
+            self.put(y, x, text, self.attr(fg, bg, bold, ul, rev))
+            x += cell_width(text)
+            width -= cell_width(text)
+
+    def header(self, title, hint):
+        self.scr.erase()
+        self.put(0, 2, title, curses.A_BOLD)
+        h, _ = self.scr.getmaxyx()
+        self.put(h - 1, 2, hint, curses.A_DIM)
+
+    def status(self, msg):
+        h, w = self.scr.getmaxyx()
+        self.put(h - 2, 2, msg.ljust(w - 4), curses.A_BOLD)
+        self.scr.refresh()
+
+    def menu_row(self, y, selected, label, value=""):
+        a = curses.A_REVERSE if selected else 0
+        self.put(y, 2, (" %-14s %s " % (label, value)).ljust(48), a)
+
+
+class Wizard:
+    def __init__(self, ui):
+        self.ui = ui
+        self.cfg = AlacrittyConfig()
+        self.prompts = Prompts()
+        self.prompt_choice = "current"
+        self.message = ""
+
+    # Main screen
+    def main(self):
+        rows = ["opacity", "font", "size", "prompt", "save", "cancel"]
+        sel = 0
+        while True:
+            ui = self.ui
+            ui.header("Terminal setup",
+                      "Up/Down move   Left/Right adjust   Enter choose   s save   Esc cancel")
+            prompt = self.prompt_choice if self.prompt_choice != "current" else self.prompts.current()
+            prompt = "system default" if prompt == "system" else prompt
+            ui.menu_row(2, sel == 0, "Transparency", "< %d%% >" % round((1 - self.cfg.opacity) * 100))
+            ui.menu_row(3, sel == 1, "Font", self.cfg.font)
+            ui.menu_row(4, sel == 2, "Font size", "< %g >" % self.cfg.size)
+            ui.menu_row(5, sel == 3, "Prompt", prompt.replace(":", ": "))
+            ui.menu_row(7, sel == 4, "Save and exit")
+            ui.menu_row(8, sel == 5, "Cancel")
+            ui.put(10, 2, FONT_SAMPLE)
+            if self.message:
+                ui.status(self.message)
+            key = ui.scr.getch()
+            self.message = ""
+            if key in (curses.KEY_UP, ord("k")):
+                sel = (sel - 1) % len(rows)
+            elif key in (curses.KEY_DOWN, ord("j"), 9):
+                sel = (sel + 1) % len(rows)
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l")):
+                step = 1 if key in (curses.KEY_RIGHT, ord("l")) else -1
+                if rows[sel] == "opacity":
+                    # Right = more transparent.
+                    self.cfg.opacity = min(1.0, max(0.1, round(self.cfg.opacity - step * 0.05, 2)))
+                elif rows[sel] == "size":
+                    self.cfg.size = min(40.0, max(6.0, self.cfg.size + step))
+            elif key in (10, 13, curses.KEY_ENTER):
+                if rows[sel] == "font":
+                    self.font_screen()
+                elif rows[sel] == "prompt":
+                    self.prompt_screen()
+                elif rows[sel] == "save":
+                    result = self.save()
+                    if result:
+                        return result
+                elif rows[sel] == "cancel":
+                    self.cfg.restore()
+                    return "Cancelled; nothing changed."
+            elif key == ord("s"):
+                result = self.save()
+                if result:
+                    return result
+            elif key in (27, ord("q")):
+                self.cfg.restore()
+                return "Cancelled; nothing changed."
+
+    def save(self):
+        changed = [ALACRITTY] if self.cfg.text != self.cfg.original else []
+        if self.prompt_choice != "current":
+            try:
+                self.prompts.apply(self.prompt_choice)
+            except (OSError, RuntimeError) as e:
+                self.message = "Couldn't set the prompt: %s" % e
+                return None
+            changed.append(PROMPT_FILE)
+            if self.prompt_choice.startswith("starship:"):
+                changed.append(STARSHIP_FILE)
+        if not changed:
+            return "Nothing changed."
+        lines = ["Saved:"] + ["  " + p for p in changed]
+        if self.prompt_choice != "current":
+            lines.append("Open a new terminal (or run: exec fish) to see the new prompt.")
+        repo = run(["git", "-C", os.path.dirname(os.path.realpath(changed[0])), "rev-parse", "--show-toplevel"]).strip()
+        if repo:
+            lines.append("These live in %s. To keep them on your other machines:" % repo)
+            lines.append('  git -C %s commit -am "Terminal settings" && git -C %s push' % (repo, repo))
+        return "\n".join(lines)
+
+    # Font picker
+    def font_screen(self):
+        start_font = self.cfg.font
+        installed = set(font_families(False))
+        options = [(fam, archive) for fam, archive in POPULAR_FONTS] + [("search", None)]
+        sel = next((i for i, (f, _) in enumerate(options) if f == start_font), 0)
+        while True:
+            ui = self.ui
+            ui.header("Font   (the highlighted font is previewed live)",
+                      "Up/Down move   Enter choose   / search installed fonts   Esc back")
+            ui.put(2, 2, "Popular (Nerd Font versions, with icons for fancy prompts)", curses.A_DIM)
+            for i, (fam, archive) in enumerate(options):
+                if fam == "search":
+                    ui.menu_row(4 + i, sel == i, "Search...", "all installed monospace fonts")
+                else:
+                    ui.menu_row(3 + i, sel == i, "", "%-26s %s" % (
+                        fam, "installed" if fam in installed else "Enter to download"))
+            ui.put(11, 2, FONT_SAMPLE)
+            ui.put(12, 2, "The quick brown fox jumps over the lazy dog")
+            fam, archive = options[sel]
+            if fam != "search" and fam in installed and self.cfg.font != fam:
+                self.cfg.font = fam
+            if not shutil.which("fc-list"):
+                ui.status("fontconfig (fc-list) not found: can't check installed fonts.")
+            key = ui.scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                sel = (sel - 1) % len(options)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                sel = (sel + 1) % len(options)
+            elif key == ord("/") or (key in (10, 13, curses.KEY_ENTER) and fam == "search"):
+                if self.search_fonts():
+                    return
+            elif key in (10, 13, curses.KEY_ENTER):
+                if fam not in installed:
+                    try:
+                        install_font(fam, archive, ui.status)
+                    except Exception as e:  # network, disk, bad archive...
+                        self.message = "Font install failed: %s" % e
+                        self.cfg.font = start_font
+                        return
+                    installed = set(font_families(False))
+                    if fam not in installed:
+                        self.message = "Installed %s, but fontconfig can't see it yet." % fam
+                self.cfg.font = fam
+                return
+            elif key in (27, ord("q")):
+                if self.cfg.font != start_font:
+                    self.cfg.font = start_font
+                return
+
+    def search_fonts(self):
+        start_font = self.cfg.font
+        families = font_families(True)
+        query, sel, top = "", 0, 0
+        while True:
+            ui = self.ui
+            matches = [f for f in families if query.lower() in f.lower()]
+            sel = min(sel, max(0, len(matches) - 1))
+            h, _ = ui.scr.getmaxyx()
+            rows = max(1, h - 9)
+            top = min(max(top, sel - rows + 1), sel)
+            ui.header("Search fonts", "Type to filter   Up/Down move   Enter choose   Esc back")
+            ui.put(2, 2, "> " + query + "_")
+            for i, fam in enumerate(matches[top:top + rows]):
+                ui.menu_row(4 + i, top + i == sel, "", fam)
+            ui.put(h - 3, 2, FONT_SAMPLE)
+            if matches and self.cfg.font != matches[sel]:
+                self.cfg.font = matches[sel]
+            key = ui.scr.get_wch()
+            if key == curses.KEY_UP:
+                sel = max(0, sel - 1)
+            elif key == curses.KEY_DOWN:
+                sel = min(len(matches) - 1, sel + 1)
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                if matches:
+                    return True
+            elif key == "\x1b":
+                if self.cfg.font != start_font:
+                    self.cfg.font = start_font
+                return False
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                query = query[:-1]
+            elif isinstance(key, str) and key.isprintable():
+                query += key
+
+    # Prompt picker
+    def prompt_screen(self):
+        items = self.prompts.items()
+        sel = next((i for i, (pid, _) in enumerate(items) if pid == self.prompt_choice), 0)
+        top = 0
+        while True:
+            ui = self.ui
+            h, w = ui.scr.getmaxyx()
+            list_w = 34
+            side = w - list_w >= 50
+            preview_x, preview_y = (list_w + 2, 2) if side else (2, 2 + min(len(items), 8) + 1)
+            preview_w = (w - preview_x - 2)
+            rows = (h - 4) if side else min(len(items), 8)
+            top = min(max(top, sel - rows + 1), sel)
+            ui.header("Prompt   (what you see before you type)",
+                      "Up/Down move   Enter choose   Esc back")
+            for i, (pid, label) in enumerate(items[top:top + rows]):
+                a = curses.A_REVERSE if top + i == sel else 0
+                ui.put(2 + i, 2, (" " + label).ljust(list_w - 2)[:list_w - 2], a)
+            pid = items[sel][0]
+            if pid == "install-starship":
+                cmd = starship_install_command()
+                ui.put(preview_y, preview_x, "Starship: fast, popular cross-shell prompt with many presets.")
+                ui.put(preview_y + 1, preview_x, "Press Enter to run: %s" % (" ".join(cmd) if cmd else "(see https://starship.rs)"))
+                ui.put(preview_y + 2, preview_x, "Most presets need a Nerd Font (pick one under Font first).", curses.A_DIM)
+            else:
+                y = preview_y
+                for s, (title, _, _) in enumerate(SCENARIOS):
+                    if y >= h - 2:
+                        break
+                    ui.put(y, preview_x, title, curses.A_DIM)
+                    y += 1
+                    rendered = self.prompts.render(pid, s, max(40, preview_w))
+                    left, _, right = rendered.partition("\x1e")
+                    left_lines = parse_ansi(left)
+                    for n, runs in enumerate(left_lines):
+                        ui.put_ansi_line(y, preview_x + 1, runs, preview_w - 1)
+                        if n == len(left_lines) - 1:
+                            rruns = parse_ansi(right.strip("\n"))[0]
+                            rw = sum(cell_width(r[0]) for r in rruns)
+                            if rruns and rw < preview_w - 20:
+                                ui.put_ansi_line(y, preview_x + preview_w - rw, rruns, rw)
+                        y += 1
+                    y += 1
+            ui.scr.refresh()
+            key = ui.scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                sel = (sel - 1) % len(items)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                sel = (sel + 1) % len(items)
+            elif key == curses.KEY_PPAGE:
+                sel = max(0, sel - rows)
+            elif key == curses.KEY_NPAGE:
+                sel = min(len(items) - 1, sel + rows)
+            elif key in (10, 13, curses.KEY_ENTER):
+                if pid == "install-starship":
+                    self.install_starship()
+                    items = self.prompts.items()
+                    continue
+                self.prompt_choice = pid
+                return
+            elif key in (27, ord("q")):
+                return
+
+    def install_starship(self):
+        cmd = starship_install_command()
+        if not cmd:
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        print("$ " + " ".join(cmd))
+        subprocess.call(cmd)
+        input("\nPress Enter to go back to term-setup...")
+        curses.reset_prog_mode()
+        self.ui.scr.refresh()
+
+
+def main():
+    if len(sys.argv) > 1:
+        print(__doc__.strip())
+        return 0 if sys.argv[1] in ("-h", "--help") else 2
+    if not sys.stdout.isatty():
+        print("term-setup needs an interactive terminal", file=sys.stderr)
+        return 1
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    wizard = None
+
+    def app(scr):
+        nonlocal wizard
+        wizard = Wizard(UI(scr))
+        return wizard.main()
+
+    try:
+        result = curses.wrapper(app)
+    except KeyboardInterrupt:
+        if wizard:
+            wizard.cfg.restore()
+        result = "Cancelled; nothing changed."
+    finally:
+        if wizard:
+            wizard.prompts.cleanup()
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
