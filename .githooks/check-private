@@ -14,6 +14,7 @@
 # false positive. gitleaks, when installed, runs as well and has no such escape.
 
 set -uo pipefail
+export LC_ALL=C   # treat arbitrary bytes as bytes in awk/grep
 
 PRIVATE_LIST="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles/private-strings"
 
