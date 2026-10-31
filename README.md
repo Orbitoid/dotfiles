@@ -7,7 +7,7 @@ Mint/Ubuntu/Debian, Fedora, SteamOS, Bazzite).
 ## Install
 
 ```sh
-git clone https://github.com/<you>/dotfiles ~/dotfiles
+git clone https://github.com/Orbitoid/dotfiles ~/dotfiles
 ~/dotfiles/install.sh              # packages + configs
 ~/dotfiles/install.sh --no-packages   # configs only
 ```
