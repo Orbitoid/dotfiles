@@ -85,11 +85,14 @@ unless you skip it as well.
 |---|---|
 | `tm` | attach to the most recent session (or start one) |
 | `tm NAME` | attach to `NAME`, creating it if needed |
+| `tm ls` | list running sessions, most recent first |
+| `tm rm NAME...` | kill sessions |
 | `tm <Tab>` | running sessions, most recent first |
 | `tm abc<Tab>` | sessions starting with `abc`; if none, folders in `~/active_workspaces` |
 
 New sessions start in `~/active_workspaces/NAME` if that folder exists. Set
-`TM_WORKSPACES` to use a different folder.
+`TM_WORKSPACES` to use a different folder. Because `ls` and `rm` are
+subcommands, `tm` can't attach to sessions with those names.
 
 ## tmux
 

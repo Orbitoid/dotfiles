@@ -13,8 +13,9 @@ esac
 
 _tm() {
     local cur=${COMP_WORDS[COMP_CWORD]} line restore
+    local -a args=("$cur")
     COMPREPLY=()
-    [ "$COMP_CWORD" -eq 1 ] || return
+    [ "$COMP_CWORD" -gt 1 ] && args+=("${COMP_WORDS[1]}")
     restore=$(shopt -p nocasematch)
     shopt -s nocasematch
     while IFS= read -r line; do
@@ -22,7 +23,7 @@ _tm() {
         case $line in
             "$cur"*) COMPREPLY+=("$(printf '%q' "$line")") ;;
         esac
-    done < <(tm --complete "$cur")
+    done < <(tm --complete "${args[@]}")
     eval "$restore"
 }
 complete -o nosort -F _tm tm 2>/dev/null || complete -F _tm tm

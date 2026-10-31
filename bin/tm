@@ -3,7 +3,10 @@
 #
 #   tm               attach to the most recent session (or start a new one)
 #   tm NAME          attach to session NAME, creating it if it doesn't exist
-#   tm --complete T  completion candidates for T (used by the shell completions)
+#   tm ls            list running sessions (most recent first)
+#   tm rm NAME...    kill the named sessions
+#   tm --complete T [ARG]  completion candidates for T, ARG being the first
+#                    argument if T isn't it (used by the shell completions)
 #
 # New sessions start in $TM_WORKSPACES/NAME when that folder exists.
 # The first run after a reboot restores the last tmux-resurrect save.
@@ -12,32 +15,73 @@ workspaces=${TM_WORKSPACES:-$HOME/active_workspaces}
 resurrect_last=$HOME/.local/share/tmux/resurrect/last
 restore_script=${XDG_CONFIG_HOME:-$HOME/.config}/tmux/plugins/tmux-resurrect/scripts/restore.sh
 
-# Running sessions starting with $1 (most recent first); if there are none,
-# folder names in $workspaces. One "name<TAB>kind" per line.
+# Running session names, most recent first.
+sessions() {
+    tmux list-sessions -F '#{session_activity} #{session_name}' 2>/dev/null |
+        sort -rn | cut -d' ' -f2-
+}
+
+# tmux turns '.' and ':' into '_' in session names.
+session_name() {
+    printf '%s' "$1" | tr '.:' '__'
+}
+
+# First argument: running sessions starting with $1 (most recent first), or
+# if there are none, folder names in $workspaces; plus the matching
+# subcommands once something has been typed. After `rm`: running sessions.
+# One "name<TAB>kind" per line.
 complete() {
-    matches=$(tmux list-sessions -F '#{session_activity} #{session_name}' 2>/dev/null |
-        sort -rn | cut -d' ' -f2- |
+    if [ $# -gt 1 ]; then
+        [ "$2" = rm ] && sessions | awk '{ print $0 "\tsession" }'
+        return
+    fi
+    matches=$(sessions |
         awk -v t="$1" 'NF && index(tolower($0), tolower(t)) == 1 { print $0 "\tsession" }')
     if [ -n "$matches" ]; then
         printf '%s\n' "$matches"
-        return
+    else
+        for d in "$workspaces"/*/; do
+            [ -d "$d" ] || continue
+            d=${d%/}
+            printf '%s\tworkspace\n' "${d##*/}"
+        done
     fi
-    for d in "$workspaces"/*/; do
-        [ -d "$d" ] || continue
-        d=${d%/}
-        printf '%s\tworkspace\n' "${d##*/}"
-    done
+    [ -n "$1" ] && printf 'ls\tlist sessions\nrm\tkill sessions\n' |
+        awk -v t="$1" 'index($0, t) == 1'
 }
 
 case $1 in
-    --complete) complete "$2"; exit ;;
-    -h|--help) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit ;;
+    --complete) shift; complete "$@"; exit ;;
+    -h|--help) sed -n '2,13s/^# \{0,1\}//p' "$0"; exit ;;
 esac
 
 if ! command -v tmux >/dev/null 2>&1; then
     echo "tm: tmux is not installed" >&2
     exit 1
 fi
+
+case $1 in
+    ls)
+        sessions
+        exit ;;
+    rm)
+        shift
+        if [ $# -eq 0 ]; then
+            echo "usage: tm rm NAME..." >&2
+            exit 2
+        fi
+        status=0
+        for n in "$@"; do
+            name=$(session_name "$n")
+            if tmux has-session -t "=$name" 2>/dev/null; then
+                tmux kill-session -t "=$name"
+            else
+                echo "tm: no session named $n" >&2
+                status=1
+            fi
+        done
+        exit $status ;;
+esac
 
 if ! tmux has-session 2>/dev/null && [ -e "$resurrect_last" ] && [ -x "$restore_script" ]; then
     tmux start-server \; run-shell "$restore_script"
@@ -51,8 +95,7 @@ if [ $# -eq 0 ]; then
     exit
 fi
 
-# tmux turns '.' and ':' into '_' in session names.
-name=$(printf '%s' "$*" | tr '.:' '__')
+name=$(session_name "$*")
 dir=$PWD
 [ -d "$workspaces/$*" ] && dir=$workspaces/$*
 

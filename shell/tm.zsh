@@ -10,9 +10,9 @@ typeset -U path
 path=("$HOME/.local/bin" $path)
 
 _tm() {
-    (( CURRENT == 2 )) || return
-    local -a names
-    names=("${(@f)$(tm --complete "$PREFIX" | cut -f1)}")
+    local -a names args=("$PREFIX")
+    (( CURRENT > 2 )) && args+=("$words[2]")
+    names=("${(@f)$(tm --complete "${args[@]}" | cut -f1)}")
     names=(${names:#})
     compadd -V tm -M 'm:{a-zA-Z}={A-Za-z}' -a names
 }
